@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.3.3";
+const VERSION = "2.4.0";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -437,6 +437,43 @@ export default {
         name, breaker: breakerOpen(name) ? "open" : "closed",
       }));
       return json({ ok: true, version: VERSION, engines, features: ["search", "fetch", "proxy", "transcript"] }, 200, cors());
+    }
+
+    // ── Event webhook: GitHub Actions pushes events here ──
+    if (url.pathname === "/webhook/github" && request.method === "POST") {
+      try {
+        const body = await request.text();
+        const event = {
+          ts: Date.now(),
+          type: request.headers.get("github-event") || "workflow_run",
+          data: JSON.parse(body),
+        };
+        // Store latest event + append to events list
+        await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
+        const key = `evt-${event.ts}`;
+        await env.EVENTS_KV.put(key, JSON.stringify(event), { expirationTtl: 86400 });
+        return json({ ok: true, stored: key }, 200, cors());
+      } catch (e) {
+        return json({ error: String(e).slice(0, 200) }, 400, cors());
+      }
+    }
+
+    // ── Long-poll: sandbox waits here until a new event arrives ──
+    if (url.pathname === "/events/wait") {
+      const since = parseInt(url.searchParams.get("since") || "0");
+      const maxWait = Math.min(parseInt(url.searchParams.get("wait") || "55"), 55) * 1000;
+      const deadline = Date.now() + maxWait;
+      while (Date.now() < deadline) {
+        const raw = await env.EVENTS_KV.get("latest");
+        if (raw) {
+          const evt = JSON.parse(raw);
+          if (evt.ts > since) {
+            return json(evt, 200, cors());
+          }
+        }
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      return new Response(null, { status: 204, headers: cors() });
     }
 
     // Universal proxy: any HTTP method, any URL, headers + body forwarded
