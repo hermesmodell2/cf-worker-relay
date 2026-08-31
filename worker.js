@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.4.0";
+const VERSION = "2.4.1";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -443,16 +443,22 @@ export default {
     if (url.pathname === "/webhook/github" && request.method === "POST") {
       try {
         const body = await request.text();
-        const event = {
-          ts: Date.now(),
-          type: request.headers.get("github-event") || "workflow_run",
-          data: JSON.parse(body),
-        };
-        // Store latest event + append to events list
+        const raw = JSON.parse(body);
+        const wr = raw.workflow_run || {};
+        // Pre-format message server-side so client stays dumb & tiny
+        let msg;
+        if (wr.head_sha) {
+          const sha = String(wr.head_sha).slice(0, 7);
+          const con = wr.conclusion || "running";
+          const name = wr.name || "workflow";
+          const icon = con === "success" ? "\u2705" : (con === "failure" ? "\u274c" : "\u23f3");
+          msg = icon + " " + name + ": " + sha + " \u2192 " + con;
+        } else {
+          msg = "\ud83d\udce9 " + (request.headers.get("github-event") || "event");
+        }
+        const event = { ts: Date.now(), type: request.headers.get("github-event") || "workflow_run", msg };
         await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
-        const key = `evt-${event.ts}`;
-        await env.EVENTS_KV.put(key, JSON.stringify(event), { expirationTtl: 86400 });
-        return json({ ok: true, stored: key }, 200, cors());
+        return json({ ok: true, msg }, 200, cors());
       } catch (e) {
         return json({ error: String(e).slice(0, 200) }, 400, cors());
       }
