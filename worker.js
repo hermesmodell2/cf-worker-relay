@@ -16,7 +16,20 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.4.3";
+// ── Event queue helpers (KV-backed, capped, race-tolerant) ──────────────────
+async function readQueue(env) {
+  try { return JSON.parse(await env.EVENTS_KV.get("queue") || "[]"); }
+  catch { return []; }
+}
+async function enqueueEvent(env, event) {
+  const q = await readQueue(env);
+  q.push(event);
+  while (q.length > 50) q.shift();          // cap history
+  await env.EVENTS_KV.put("queue", JSON.stringify(q), { expirationTtl: 86400 });
+  await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
+}
+
+const VERSION = "2.5.0";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -458,7 +471,7 @@ export default {
           msg = "\ud83d\udce9 " + (request.headers.get("github-event") || "event");
         }
         const event = { ts: Date.now(), type: request.headers.get("github-event") || "workflow_run", msg };
-        await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
+        await enqueueEvent(env, event);
         return json({ ok: true, msg }, 200, cors());
       } catch (e) {
         return json({ error: String(e).slice(0, 200) }, 400, cors());
@@ -474,7 +487,7 @@ export default {
         const icon = level === "ok" ? "\u2705" : (level === "fail" ? "\u274c" : "\u2139\uFE0F");
         const msg = icon + " " + (raw.source ? raw.source + " / " : "") + String(raw.msg || "event");
         const event = { ts: Date.now(), type: raw.source || "internal", msg };
-        await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
+        await enqueueEvent(env, event);
         return json({ ok: true, msg }, 200, cors());
       } catch (e) {
         return json({ error: String(e).slice(0, 200) }, 400, cors());
@@ -487,13 +500,9 @@ export default {
       const maxWait = Math.min(parseInt(url.searchParams.get("wait") || "55"), 55) * 1000;
       const deadline = Date.now() + maxWait;
       while (Date.now() < deadline) {
-        const raw = await env.EVENTS_KV.get("latest");
-        if (raw) {
-          const evt = JSON.parse(raw);
-          if (evt.ts > since) {
-            return json(evt, 200, cors());
-          }
-        }
+        const q = await readQueue(env);
+        const next = q.find(e => e.ts > since);
+        if (next) return json(next, 200, cors());
         await new Promise(r => setTimeout(r, 2000));
       }
       return new Response(null, { status: 204, headers: cors() });
