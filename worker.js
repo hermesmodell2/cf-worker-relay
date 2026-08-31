@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.4.2";
+const VERSION = "2.4.3";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -458,6 +458,22 @@ export default {
           msg = "\ud83d\udce9 " + (request.headers.get("github-event") || "event");
         }
         const event = { ts: Date.now(), type: request.headers.get("github-event") || "workflow_run", msg };
+        await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
+        return json({ ok: true, msg }, 200, cors());
+      } catch (e) {
+        return json({ error: String(e).slice(0, 200) }, 400, cors());
+      }
+    }
+
+    // ── Generic event webhook: any internal script can emit events ──
+    // POST {"msg":"...", "level":"ok|fail|info"} — level prefixes the message
+    if (url.pathname === "/webhook/any" && request.method === "POST") {
+      try {
+        const raw = await request.json();
+        const level = raw.level || "info";
+        const icon = level === "ok" ? "\u2705" : (level === "fail" ? "\u274c" : "\u2139\uFE0F");
+        const msg = icon + " " + (raw.source ? raw.source + " / " : "") + String(raw.msg || "event");
+        const event = { ts: Date.now(), type: raw.source || "internal", msg };
         await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
         return json({ ok: true, msg }, 200, cors());
       } catch (e) {
