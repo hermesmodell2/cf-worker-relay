@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.3.0";
+const VERSION = "2.3.1";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -297,53 +297,124 @@ async function handleFetch(targetUrl, maxChars) {
 
 // ─── YouTube Transcript via InnerTube API ────────────────────────────────────
 async function handleTranscript(videoId, lang) {
-  // v2.3.0: InnerTube API approach — no page scraping, no regex fragility
-  // Step 1: Get video info + caption tracks via InnerTube player API
-  const innertubeUrl = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  // v2.3.1: Multi-strategy transcript extraction
+  // Strategy 1: Direct timedtext API (no InnerTube key needed)
+  // Strategy 2: Page scrape with multiple regex patterns
+  // Strategy 3: InnerTube with fallback clients
   
-  let playerResponse;
+  const title = "YouTube Video";
+  
+  // ── Strategy 1: Direct timedtext endpoint ──────────────────────────────
+  // This endpoint works without any API key for videos with captions
   try {
-    const res = await fetch(innertubeUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
-      },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: { clientName: "WEB", clientVersion: "2.20240101.00.00", hl: lang, gl: "US" },
-        },
-      }),
+    const ttUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`;
+    const ttRes = await fetch(ttUrl, {
+      headers: browserHeaders(),
+      cf: { cacheTtl: 600, cacheEverything: true },
+    });
+    if (ttRes.ok) {
+      const body = await ttRes.text();
+      if (body.trim().startsWith("{")) {
+        const data = JSON.parse(body);
+        if (data.events && data.events.length > 0) {
+          const segments = [];
+          for (const evt of data.events) {
+            if (evt.segs) {
+              const text = evt.segs.map(s => s.utf8 || "").join("").replace(/\n/g, " ").trim();
+              if (text) segments.push({ start: (evt.tStartMs||0)/1000, duration: (evt.dDurationMs||0)/1000, text });
+            }
+          }
+          if (segments.length > 0) {
+            return json({ video_id: videoId, language: lang, segment_count: segments.length, segments, method: "timedtext_direct" }, 200, cors());
+          }
+        }
+      }
+    }
+  } catch (e) { /* continue to next strategy */ }
+  
+  // ── Strategy 2: Fetch page and extract caption tracks ──────────────────
+  let captionTracks = [];
+  let videoTitle = "Unknown";
+  try {
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { ...browserHeaders(), "Accept-Language": `${lang},en;q=0.9` },
       cf: { cacheTtl: 300, cacheEverything: true },
     });
-    playerResponse = await res.json();
-  } catch (e) {
-    return json({ error: "InnerTube API failed: " + String(e).slice(0, 200) }, 502, cors());
-  }
-
-  const videoDetails = playerResponse.videoDetails || {};
-  const title = videoDetails.title || "Unknown";
-  const duration = parseInt(videoDetails.lengthSeconds) || 0;
-
-  // Get caption tracks
-  const captionTracks = playerResponse.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const html = await pageRes.text();
+    
+    // Extract title
+    const titleMatch = html.match(/<title>(.*?)<\/title>/);
+    if (titleMatch) videoTitle = titleMatch[1].replace(" - YouTube", "").trim();
+    
+    // Multiple regex patterns for caption track extraction
+    const patterns = [
+      /"captionTracks":\s*(\[.*?\])/s,
+      /playerCaptionsTracklistRenderer.*?"captionTracks":\s*(\[.*?\])/s,
+      /"captions".*?"captionTracks":\s*(\[.*?\])/s,
+    ];
+    
+    for (const pat of patterns) {
+      const m = html.match(pat);
+      if (m) {
+        try {
+          // Unescape JSON string (YouTube escapes quotes in embedded JSON)
+          let jsonStr = m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+          captionTracks = JSON.parse(jsonStr);
+          if (captionTracks.length > 0) break;
+        } catch (e) { /* try next pattern */ }
+      }
+    }
+  } catch (e) { /* continue */ }
+  
+  // ── Strategy 3: InnerTube with multiple client types ───────────────────
   if (captionTracks.length === 0) {
-    return json({ error: "No captions available", video_id: videoId, title }, 404, cors());
+    const clients = [
+      { clientName: "WEB", clientVersion: "2.20250331" },
+      { clientName: "MWEB", clientVersion: "2.20250331" },
+      { clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER", clientVersion: "2.0" },
+    ];
+    
+    for (const client of clients) {
+      try {
+        const res = await fetch("https://www.youtube.com/youtubei/v1/player", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://www.youtube.com",
+            "Referer": "https://www.youtube.com/",
+          },
+          body: JSON.stringify({
+            videoId,
+            context: { client: { ...client, hl: lang, gl: "US" } },
+          }),
+          cf: { cacheTtl: 300 },
+        });
+        const data = await res.json();
+        const tracks = data.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+        if (tracks.length > 0) {
+          captionTracks = tracks;
+          videoTitle = data.videoDetails?.title || videoTitle;
+          break;
+        }
+      } catch (e) { /* try next client */ }
+    }
   }
-
+  
+  if (captionTracks.length === 0) {
+    return json({ error: "No captions available", video_id: videoId, title: videoTitle, strategies_tried: 3 }, 404, cors());
+  }
+  
   // Find best language match
   let track = captionTracks.find(t => t.languageCode === lang)
     || captionTracks.find(t => t.languageCode.startsWith(lang.split("-")[0]))
     || captionTracks.find(t => t.kind === "asr")
     || captionTracks[0];
-
-  // Step 2: Fetch captions in JSON3 format
+  
+  // Fetch captions
   let captionUrl = track.baseUrl;
   if (!captionUrl.includes("fmt=")) captionUrl += "&fmt=json3";
-
+  
   let segments = [];
   try {
     const capRes = await fetch(captionUrl, {
@@ -352,7 +423,7 @@ async function handleTranscript(videoId, lang) {
     });
     const ct = capRes.headers.get("content-type") || "";
     const body = await capRes.text();
-
+    
     if (ct.includes("json") || body.trim().startsWith("{")) {
       const data = JSON.parse(body);
       if (data.events) {
@@ -364,23 +435,20 @@ async function handleTranscript(videoId, lang) {
         }
       }
     } else {
-      // XML fallback
-      const parsed = parseTimedtextXml(body);
-      segments = parsed.segments || [];
+      segments = (parseTimedtextXml(body).segments || []);
     }
   } catch (e) {
-    // Try raw XML without fmt param
+    // XML fallback
     try {
       const xmlRes = await fetch(track.baseUrl, { headers: browserHeaders(), cf: { cacheTtl: 600 } });
-      const xmlBody = await xmlRes.text();
-      segments = (parseTimedtextXml(xmlBody).segments || []);
+      segments = (parseTimedtextXml(await xmlRes.text()).segments || []);
     } catch (e2) {
       return json({ error: "Caption fetch failed: " + String(e2).slice(0, 200) }, 502, cors());
     }
   }
-
+  
   return json({
-    video_id: videoId, title, duration,
+    video_id: videoId, title: videoTitle, 
     language: track.languageCode,
     segment_count: segments.length,
     segments,
