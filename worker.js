@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.4.1";
+const VERSION = "2.4.2";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -451,8 +451,9 @@ export default {
           const sha = String(wr.head_sha).slice(0, 7);
           const con = wr.conclusion || "running";
           const name = wr.name || "workflow";
+          const repo = (raw.repository && raw.repository.full_name) || "";
           const icon = con === "success" ? "\u2705" : (con === "failure" ? "\u274c" : "\u23f3");
-          msg = icon + " " + name + ": " + sha + " \u2192 " + con;
+          msg = icon + " " + (repo ? repo + " / " : "") + name + ": " + sha + " \u2192 " + con;
         } else {
           msg = "\ud83d\udce9 " + (request.headers.get("github-event") || "event");
         }
