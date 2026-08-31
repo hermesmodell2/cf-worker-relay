@@ -16,7 +16,7 @@
 //   - Result normalization + dedup + scoring (relevance signals)
 // ============================================================================
 
-const VERSION = "2.3.2";
+const VERSION = "2.3.3";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
@@ -297,7 +297,7 @@ async function handleFetch(targetUrl, maxChars) {
 
 // ─── YouTube Transcript via InnerTube API ────────────────────────────────────
 async function handleTranscript(videoId, lang) {
-  // v2.3.2: Page-scrape timedtext URL + direct fetch (most reliable method)
+  // v2.3.3: Fetch page via proxy, extract captionTracks JSON, fetch timedtext
   const pageUrl = `https://www.youtube.com/watch?v=${videoId}`;
   let pageHtml;
   try {
@@ -314,74 +314,51 @@ async function handleTranscript(videoId, lang) {
     return json({ error: "Page fetch failed: " + String(e).slice(0, 200) }, 502, cors());
   }
 
-  // Extract captionTracks from page HTML (multiple regex patterns for resilience)
-  let captionTracks = [];
-  let title = "Unknown";
-  let duration = 0;
-
-  // Pattern 1: ytInitialPlayerResponse JSON block
-  const playerMatch = pageHtml.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var|const|let|<\/script)/s);
-  if (playerMatch) {
-    try {
-      const pr = JSON.parse(playerMatch[1]);
-      title = pr.videoDetails?.title || title;
-      duration = parseInt(pr.videoDetails?.lengthSeconds) || 0;
-      captionTracks = pr.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    } catch {}
+  // Extract ytInitialPlayerResponse
+  const playerMatch = pageHtml.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*(?:var|const|let|<\/script)/);
+  if (!playerMatch) {
+    return json({ error: "Could not extract player response", video_id: videoId }, 404, cors());
   }
 
-  // Pattern 2: captionTracks in raw HTML (escaped JSON)
+  let playerResponse;
+  try {
+    playerResponse = JSON.parse(playerMatch[1]);
+  } catch (e) {
+    return json({ error: "Player response parse failed: " + String(e).slice(0, 200) }, 500, cors());
+  }
+
+  const videoDetails = playerResponse.videoDetails || {};
+  const title = videoDetails.title || "Unknown";
+  const duration = parseInt(videoDetails.lengthSeconds) || 0;
+
+  const captionTracks = playerResponse.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
   if (captionTracks.length === 0) {
-    const tracksMatch = pageHtml.match(/"captionTracks"\s*:\s*(\[.+?\])/);
-    if (tracksMatch) {
-      try {
-        const raw = tracksMatch[1].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
-        captionTracks = JSON.parse(raw);
-      } catch {}
-    }
+    return json({ error: "No captions available", video_id: videoId, title }, 404, cors());
   }
 
-  // Pattern 3: timedtext URL directly in page
-  if (captionTracks.length === 0) {
-    const ttMatch = pageHtml.match(/(https:\/\/www\.youtube\.com\/api\/timedtext\?[^"'\s\\]+)/);
-    if (ttMatch) {
-      const url = ttMatch[1].replace(/\\u0026/g, "&");
-      captionTracks = [{ baseUrl: url, languageCode: "en" }];
-    }
-  }
-
-  // Extract title from og:title if still unknown
-  if (title === "Unknown") {
-    const ogMatch = pageHtml.match(/<meta\s+property="og:title"\s+content="([^"]+)"/);
-    if (ogMatch) title = ogMatch[1];
-  }
-
-  if (captionTracks.length === 0) {
-    return json({ error: "No captions found on page", video_id: videoId, title, strategies_tried: 3 }, 404, cors());
-  }
-
-  // Find best language track
+  // Find best language match
   let track = captionTracks.find(t => t.languageCode === lang)
     || captionTracks.find(t => t.languageCode.startsWith(lang.split("-")[0]))
     || captionTracks.find(t => t.kind === "asr")
     || captionTracks[0];
 
-  // Fetch captions — try JSON3 first, then XML
-  let captionUrl = track.baseUrl || "";
-  // Unescape any remaining unicode escapes
-  captionUrl = captionUrl.replace(/\\u0026/g, "&");
+  // Fetch timedtext in JSON3 format
+  let captionUrl = track.baseUrl;
+  if (!captionUrl.includes("fmt=")) captionUrl += "&fmt=json3";
 
   let segments = [];
-
-  // Try JSON3 format
   try {
-    const json3Url = captionUrl.includes("fmt=") ? captionUrl : captionUrl + "&fmt=json3";
-    const capRes = await fetch(json3Url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    const capRes = await fetch(captionUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json,text/xml,*/*",
+      },
       cf: { cacheTtl: 600, cacheEverything: true },
     });
     const body = await capRes.text();
-    if (body.trim().startsWith("{")) {
+    const ct = capRes.headers.get("content-type") || "";
+
+    if (ct.includes("json") || body.trim().startsWith("{")) {
       const data = JSON.parse(body);
       if (data.events) {
         for (const evt of data.events) {
@@ -391,24 +368,25 @@ async function handleTranscript(videoId, lang) {
           }
         }
       }
+    } else {
+      segments = (parseTimedtextXml(body).segments || []);
     }
-  } catch {}
-
-  // Fallback: XML timedtext
-  if (segments.length === 0) {
+  } catch (e) {
+    // Fallback: try raw XML without fmt param
     try {
-      const xmlRes = await fetch(captionUrl, {
+      const xmlRes = await fetch(track.baseUrl, {
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-        cf: { cacheTtl: 600, cacheEverything: true },
+        cf: { cacheTtl: 600 },
       });
-      const xmlBody = await xmlRes.text();
-      segments = (parseTimedtextXml(xmlBody).segments || []);
-    } catch {}
+      segments = (parseTimedtextXml(await xmlRes.text()).segments || []);
+    } catch (e2) {
+      return json({ error: "Caption fetch failed: " + String(e2).slice(0, 200) }, 502, cors());
+    }
   }
 
   return json({
     video_id: videoId, title, duration,
-    language: track.languageCode || lang,
+    language: track.languageCode,
     segment_count: segments.length,
     segments,
   }, 200, cors());
