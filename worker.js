@@ -459,14 +459,24 @@ export default {
         const raw = JSON.parse(body);
         const wr = raw.workflow_run || {};
         // Pre-format message server-side so client stays dumb & tiny
+        // v2.6.0: 1:1 pairing — every run emits exactly ONE start (in_progress)
+        // and ONE result (completed). queued is dropped (it duplicated starts).
+        // run_id included so start and result are always matchable.
         let msg;
         if (wr.head_sha) {
+          const status = wr.status || "";
+          if (status === "queued") {
+            return json({ ok: true, skipped: "queued" }, 200, cors());
+          }
           const sha = String(wr.head_sha).slice(0, 7);
           const con = wr.conclusion || "running";
+          const rid = wr.id || "";
           const name = wr.name || "workflow";
           const repo = (raw.repository && raw.repository.full_name) || "";
-          const icon = con === "success" ? "\u2705" : (con === "failure" ? "\u274c" : "\u23f3");
-          msg = icon + " " + (repo ? repo + " / " : "") + name + ": " + sha + " \u2192 " + con;
+          const started = status !== "completed";
+          const icon = started ? "\u23f3" : (con === "success" ? "\u2705" : "\u274c");
+          const label = started ? "started" : con;
+          msg = icon + " " + (repo ? repo + " / " : "") + name + " #" + rid + " (" + sha + ") \u2192 " + label;
         } else {
           msg = "\ud83d\udce9 " + (request.headers.get("github-event") || "event");
         }
