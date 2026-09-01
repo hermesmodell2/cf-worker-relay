@@ -29,7 +29,7 @@ async function enqueueEvent(env, event) {
   await env.EVENTS_KV.put("latest", JSON.stringify(event), { expirationTtl: 86400 });
 }
 
-const VERSION = "2.5.0";
+const VERSION = "2.6.0";
 const CACHE_TTL_OK = 300;          // 5 min fresh
 const CACHE_TTL_STALE = 3600;      // 1h serve-stale window
 const RATE_LIMIT = 30;             // requests per window per IP
